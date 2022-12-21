@@ -1,36 +1,6 @@
 //SPDX-License-Identifier: Unlicense
 pragma solidity 0.5.15;
 
-contract LibNote {
-    event LogNote(
-        bytes4   indexed  sig,
-        address  indexed  usr,
-        bytes32  indexed  arg1,
-        bytes32  indexed  arg2,
-        bytes             data
-    ) anonymous;
-
-    modifier note {
-        _;
-        assembly {
-            // log an 'anonymous' event with a constant 6 words of calldata
-            // and four indexed topics: selector, caller, arg1 and arg2
-            let mark := msize()                       // end of memory ensures zero
-            mstore(0x40, add(mark, 288))              // update free memory pointer
-            mstore(mark, 0x20)                        // bytes type data offset
-            mstore(add(mark, 0x20), 224)              // bytes size (padded)
-            calldatacopy(add(mark, 0x40), 0, 224)     // bytes payload
-            log4(mark, 288,                           // calldata
-                 shl(224, shr(224, calldataload(0))), // msg.sig
-                 caller(),                            // msg.sender
-                 calldataload(4),                     // arg1
-                 calldataload(36)                     // arg2
-                )
-        }
-    }
-}
-
-
 interface VatLike {
     function hope(address) external;
 }
@@ -54,21 +24,22 @@ interface GovLike {
 }
 
 interface PotLike {
-    function pie(address guy) external returns(uint256);
-    function Pie() external returns(uint256);
-    function chi() external returns(uint256);
-    function vat() external returns(address);
-    function rho() external returns(uint256);
+    function pie(address guy) external view returns(uint256);
+    function Pie() external view returns(uint256);
+    function chi() external view returns(uint256);
+    function dsr() external view returns(uint256);
+    function vat() external view returns(address);
+    function rho() external view returns(uint256);
     function drip() external returns (uint256 tmp);
     function join(uint256) external;
     function exit(uint256) external;
 }
 
-contract DssSavingReward is LibNote  {
+contract DssSavingReward  {
     // --- Auth ---
     mapping (address => uint256) public wards;
-    function rely(address guy) external note auth { wards[guy] = 1; }
-    function deny(address guy) external note auth { wards[guy] = 0; }
+    function rely(address guy) external  auth { wards[guy] = 1; }
+    function deny(address guy) external  auth { wards[guy] = 0; }
    
     modifier auth {
         require(wards[msg.sender] == 1, "DSReward/not-authorized");
@@ -76,8 +47,10 @@ contract DssSavingReward is LibNote  {
     }
 
     // --- event ---
-    event Reward(address indexed  who, uint256 dai, uint256 gov);
-    event Compound(address indexed who, uint256 dai);
+    event EnterStaking(address indexed who, uint256 wad, uint256 dai, uint256 gov);
+    event LeaveStaking(address indexed who, uint256 wad, uint256 dai, uint256 gov);
+    event Harvest(address who, uint256 dai, uint256 gov);
+    
 
     // --- Data ---
     struct UserInfo{
@@ -148,13 +121,13 @@ contract DssSavingReward is LibNote  {
         }
     }
     function add(uint256 x, uint256 y) internal pure returns (uint256 z) {
-        require((z = x + y) >= x);
+        require((z = x + y) >= x, "DSReward/add-overflow");
     }
     function sub(uint256 x, uint256 y) internal pure returns (uint256 z) {
-        require((z = x - y) <= x);
+        require((z = x - y) <= x, "DSReward/sub-overflow");
     }
     function mul(uint256 x, uint256 y) internal pure returns (uint256 z) {
-        require(y == 0 || (z = x * y) / y == x);
+        require(y == 0 || (z = x * y) / y == x, "DSReward/mul-overflow");
     }
     function rmul(uint256 x, uint256 y) internal pure returns (uint256 z) {
         z = mul(x, y) / ONE;
@@ -170,24 +143,24 @@ contract DssSavingReward is LibNote  {
     
 
     // --- Administration ---
-    function file(bytes32 what, uint256 data) external note auth {
+    function file(bytes32 what, uint256 data) external auth {
         require(live == 1, "DSReward/not-live");
         drip();
         if (what == "dsr") dsr = data;
         else revert("DSReward/file-unrecognized-param");
     }
 
-    function file(bytes32 what, address addr) external note auth {
+    function file(bytes32 what, address addr) external auth {
         if (what == "vow") vow = addr;
         else revert("DSReward/file-unrecognized-param");
     }
 
-    function cage() external note auth {
+    function cage() external  auth {
         live = 0;
         dsr = ONE;
     }
 
-    function exit() external note auth {
+    function exit() external auth {
         require(live==0, "DSReward/invalid-live");
         gov.transfer(msg.sender ,sub(balanceGov(), reward));
     }
@@ -196,12 +169,19 @@ contract DssSavingReward is LibNote  {
         return gov.balanceOf(address(this));
     }
 
+    function daiParms() public view returns (uint256 chi_, uint256 dsr_, uint256 rho_){
+        return (pot.chi(), pot.dsr(), pot.rho());
+    }
+
+    function govParms() public view returns (uint256 chi_, uint256 dsr_, uint256 rho_){
+        return (chi, dsr, rho);
+    }
+
     // --- Savings Rate Accumulation ---
-    function drip() public note returns (uint256 tmp) {
+    function drip() public returns (uint256 tmp) {
         require(now >= rho, "DSReward/invalid-now");
         tmp = rmul(rpow(dsr, now - rho, ONE), chi);
         uint256 chi_ = sub(tmp, chi);
-        //gov.mint(address(this), rmul(Gie, chi_));
         uint256 reward_ = rmul(Gie, chi_);
         if (reward_ <= balanceGov()){
             reward = add(reward,  rmul(Gie, chi_)); 
@@ -210,35 +190,37 @@ contract DssSavingReward is LibNote  {
         rho = now;
     }
 
-    function enterStaking(uint256 wad) public note {
+
+    function enterStaking(uint256 wad) public  {
         uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi();
         drip();
 
         UserInfo storage usr = userInfo[msg.sender];
+        uint256 gov_; uint256 dai_; uint256 pie_;
         if (usr.amount > 0 ){
             //withdraw gov reward
-            uint256 gov_ = sub(rmul(usr.gie, chi), usr.amount);
-            //uint256 gie_ = rdiv(gov_, chi);
-            //usr.gie = sub(usr.gie, gie_);
-            Gie     = sub(Gie,  usr.gie);
-            gov.transfer(msg.sender, gov_);
-
-            //withdraw dai reward
-            uint256 dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
-            uint256 pie_ = rdivup(dai_, pot_chi);
-            usr.pie = sub(usr.pie, pie_);
-            Pie     = sub(Pie,     pie_);
-            pot.exit(pie_);
-            uint256 amt = rmul(pie_, pot_chi);
-            daiJoin.exit(msg.sender, amt);
+            gov_ = sub(rmul(usr.gie, chi), usr.amount);
+            if(gov_ >0){
+                Gie     = sub(Gie,  usr.gie);
+                gov.transfer(msg.sender, gov_);
+            }
             
-            emit Reward(msg.sender, amt, gov_);
+            //withdraw dai reward
+            dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
+            if (dai_ > 0){
+                pie_ = rdivup(dai_, pot_chi);
+                usr.pie = sub(usr.pie, pie_);
+                Pie     = sub(Pie,     pie_);
+                pot.exit(pie_);
+                dai_ = rmul(pie_, pot_chi);
+                daiJoin.exit(msg.sender, dai_);
+            } 
         }
         
         //join
         dai.transferFrom(msg.sender, address(this), wad);
         daiJoin.join(address(this), wad);
-        uint256 pie_ = rdiv(wad,   pot_chi);
+        pie_ = rdiv(wad,   pot_chi);
         pot.join(pie_);
 
         //update
@@ -246,40 +228,39 @@ contract DssSavingReward is LibNote  {
         supply       = add(supply,      wad);
         usr.pie      = add(usr.pie,     pie_);
         Pie          = add(Pie,         pie_);
-
         usr.gie      = rdiv(usr.amount, chi);
         Gie          = add(Gie,         usr.gie);
+
+        emit EnterStaking(msg.sender, wad, dai_, gov_);
     }
 
-    function leaveStaking(uint256 wad) public note {
+
+    function leaveStaking(uint256 wad) public {
         uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi();
         drip();
 
         UserInfo storage usr = userInfo[msg.sender];
         require(usr.amount >= wad, "DSReward/invalid-wad");
+        uint256 gov_; uint256 dai_; uint256 pie_;
         {
             //withdraw gov reward
-            uint256 gov_ = sub(rmul(usr.gie, chi), usr.amount);
-            //uint256 gie_ = rdiv(gov_, chi);
-            //usr.gie = sub(usr.gie, gie_);
+            gov_ = sub(rmul(usr.gie, chi), usr.amount);
             Gie     = sub(Gie, usr.gie);
             gov.transfer(msg.sender, gov_);
 
             //withdraw dai reward
-            uint256 dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
-            uint256 pie_ = rdivup(dai_, pot_chi);
+            dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
+            pie_ = rdivup(dai_, pot_chi);
             usr.pie = sub(usr.pie, pie_);
             Pie     = sub(Pie, pie_);
 
             pot.exit(pie_);
-            uint256 amt = rmul(pie_, pot_chi);
-            daiJoin.exit(msg.sender, amt);
-            
-            emit Reward(msg.sender, amt, gov_);
+            dai_ = rmul(pie_, pot_chi);
+            daiJoin.exit(msg.sender, dai_);
         }
         
         //exit
-        uint256 pie_ = rdivup(wad, pot_chi);
+        pie_ = rdivup(wad, pot_chi);
         pot.exit(pie_);
         uint256 amt = rmul(pie_, pot_chi);
         daiJoin.exit(msg.sender,  amt);
@@ -291,9 +272,11 @@ contract DssSavingReward is LibNote  {
         Pie          = sub(Pie,         pie_);
         usr.gie      = rdiv(usr.amount, chi);
         Gie          = add(Gie,         usr.gie);
+
+        emit LeaveStaking(msg.sender, wad, dai_, gov_);
     }
 
-    function harvest() public note {
+    function harvest() public  {
         uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi();
         drip();
         UserInfo storage usr = userInfo[msg.sender];
@@ -315,29 +298,6 @@ contract DssSavingReward is LibNote  {
         uint256 amt = rmul(pie_, pot_chi);
         daiJoin.exit(msg.sender, amt);
 
-        emit Reward(msg.sender, amt, gov_);
-    }
-
-
-    function compound() public note {
-        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi();
-        drip();
-        UserInfo storage usr = userInfo[msg.sender];
-        require(usr.amount > 0, "DSReward/invalid");
-
-        //withdraw gov reward
-        uint256 gov_ = sub(rmul(usr.gie, chi), usr.amount);
-        Gie = sub(Gie,  usr.gie);
-        gov.transfer(msg.sender, gov_);
-        emit Reward(msg.sender, 0, gov_);
-
-        //compound 
-        uint256 dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
-        usr.amount = add(usr.amount,  dai_);
-        supply     = add(supply,      dai_);
-        usr.gie    = rdiv(usr.amount, chi);
-        Gie        = add(Gie,     usr.gie); 
-       
-        emit Compound(msg.sender, dai_);
+        emit Harvest(msg.sender, dai_, gov_);
     }
 }
