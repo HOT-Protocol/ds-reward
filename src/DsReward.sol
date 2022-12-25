@@ -49,7 +49,7 @@ contract DssSavingReward  {
     // --- event ---
     event EnterStaking(address indexed who, uint256 wad, uint256 dai, uint256 gov);
     event LeaveStaking(address indexed who, uint256 wad, uint256 dai, uint256 gov);
-    event Harvest(address who, uint256 dai, uint256 gov);
+    event Harvest(address indexed who, uint256 dai, uint256 gov);
     
 
     // --- Data ---
@@ -66,13 +66,13 @@ contract DssSavingReward  {
     uint256 public Gie;   // Total Normalised Savings Dai  [wad]
     uint256 public dsr;   // The Gov Savings Rate          [ray]
     uint256 public chi;   // The Rate Accumulator          [ray]
+    uint256 public dust;  // The min Saving                [wad]
 
     GovLike public gov;   // Governance Token
     PotLike public pot;   // Savings Engine
     GemLike public dai;   // HGBP
     JoinLike public daiJoin; 
 
-    address public vow;   // Debt Engine
     uint256 public rho;   // Time of last drip     [unix epoch time]
 
     uint256 public live;  // Active Flag
@@ -89,6 +89,7 @@ contract DssSavingReward  {
         chi = ONE;
         rho = now;
         live = 1;
+        dust = 10e18;
         VatLike vat = VatLike(pot.vat());
         vat.hope(daiJoin_);
         vat.hope(pot_);
@@ -145,15 +146,11 @@ contract DssSavingReward  {
     // --- Administration ---
     function file(bytes32 what, uint256 data) external auth {
         require(live == 1, "DSReward/not-live");
-        drip();
-        if (what == "dsr") dsr = data;
+        if (what == "dust") dust = data;
+        else if (what == "dsr") {drip() ;dsr = data;}
         else revert("DSReward/file-unrecognized-param");
     }
 
-    function file(bytes32 what, address addr) external auth {
-        if (what == "vow") vow = addr;
-        else revert("DSReward/file-unrecognized-param");
-    }
 
     function cage() external  auth {
         live = 0;
@@ -190,33 +187,35 @@ contract DssSavingReward  {
         rho = now;
     }
 
+    // --- Calculated Rewards ---
+    function rewardAmounts(address usr, uint256 chi_, uint256 pot_chi) public view returns (uint256 gov_, uint256 dai_){
+        if (userInfo[usr].amount > 0){
+            gov_ = sub(rmul(userInfo[usr].gie, chi_), userInfo[usr].amount);
+            dai_ = sub(rmul(userInfo[usr].pie, pot_chi), userInfo[usr].amount);
+        }
+    }
 
-    function enterStaking(uint256 wad) public  {
-        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi();
-        drip();
-
+    function enterStaking(uint256 wad) public {
+        require(wad >= dust, "DSReward/invalid-wad");
+        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi(); drip();
         UserInfo storage usr = userInfo[msg.sender];
-        uint256 gov_; uint256 dai_; uint256 pie_;
-        if (usr.amount > 0 ){
+        uint256 pie_; uint256 gov_; uint256 dai_ ;
+        if (usr.amount > 0){
+            (gov_, dai_) = rewardAmounts(msg.sender, chi, pot_chi);
+
             //withdraw gov reward
-            gov_ = sub(rmul(usr.gie, chi), usr.amount);
-            if(gov_ >0){
-                Gie     = sub(Gie,  usr.gie);
-                gov.transfer(msg.sender, gov_);
-            }
+            Gie     = sub(Gie,  usr.gie);
+            gov.transfer(msg.sender, gov_);
             
             //withdraw dai reward
-            dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
-            if (dai_ > 0){
-                pie_ = rdivup(dai_, pot_chi);
-                usr.pie = sub(usr.pie, pie_);
-                Pie     = sub(Pie,     pie_);
-                pot.exit(pie_);
-                dai_ = rmul(pie_, pot_chi);
-                daiJoin.exit(msg.sender, dai_);
-            } 
+            pie_ = rdivup(dai_, pot_chi);
+            usr.pie = sub(usr.pie, pie_);
+            Pie     = sub(Pie,     pie_);
+            pot.exit(pie_);
+            dai_ = rmul(pie_, pot_chi);
+            daiJoin.exit(msg.sender, dai_);
         }
-        
+    
         //join
         dai.transferFrom(msg.sender, address(this), wad);
         daiJoin.join(address(this), wad);
@@ -236,67 +235,88 @@ contract DssSavingReward  {
 
 
     function leaveStaking(uint256 wad) public {
-        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi();
-        drip();
-
+        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi(); drip();
         UserInfo storage usr = userInfo[msg.sender];
-        require(usr.amount >= wad, "DSReward/invalid-wad");
-        uint256 gov_; uint256 dai_; uint256 pie_;
-        {
-            //withdraw gov reward
-            gov_ = sub(rmul(usr.gie, chi), usr.amount);
-            Gie     = sub(Gie, usr.gie);
-            gov.transfer(msg.sender, gov_);
+        require(sub(usr.amount, wad) >= dust || wad == usr.amount , "DSReward/invalid-wad");
+        if (wad == usr.amount){
+            leaveAllStaking();
+        }else {
+            (uint256 gov_, uint256 dai_) = rewardAmounts(msg.sender, chi, pot_chi);
+            uint256 pie_;
+            {
+                //withdraw gov reward
+                Gie     = sub(Gie, usr.gie);
+                gov.transfer(msg.sender, gov_);
 
-            //withdraw dai reward
-            dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
-            pie_ = rdivup(dai_, pot_chi);
-            usr.pie = sub(usr.pie, pie_);
-            Pie     = sub(Pie, pie_);
+                //withdraw dai reward
+                pie_ = rdivup(dai_, pot_chi);
+                usr.pie = sub(usr.pie, pie_);
+                Pie     = sub(Pie, pie_);
 
+                pot.exit(pie_);
+                dai_ = rmul(pie_, pot_chi);
+                daiJoin.exit(msg.sender, dai_);
+            }
+            
+            //exit
+            pie_ = rdivup(wad, pot_chi);
             pot.exit(pie_);
-            dai_ = rmul(pie_, pot_chi);
-            daiJoin.exit(msg.sender, dai_);
+            uint256 amt = rmul(pie_, pot_chi);
+            daiJoin.exit(msg.sender,  amt);
+
+            //update
+            usr.amount   = sub(usr.amount,  wad);
+            supply       = sub(supply,      wad);
+            usr.pie      = sub(usr.pie,     pie_);
+            Pie          = sub(Pie,         pie_);
+            usr.gie      = rdiv(usr.amount, chi);
+            Gie          = add(Gie,         usr.gie);
+
+            emit LeaveStaking(msg.sender, wad, dai_, gov_);
         }
-        
-        //exit
-        pie_ = rdivup(wad, pot_chi);
-        pot.exit(pie_);
-        uint256 amt = rmul(pie_, pot_chi);
-        daiJoin.exit(msg.sender,  amt);
-
-        //update
-        usr.amount   = sub(usr.amount,  wad);
-        supply       = sub(supply,      wad);
-        usr.pie      = sub(usr.pie,     pie_);
-        Pie          = sub(Pie,         pie_);
-        usr.gie      = rdiv(usr.amount, chi);
-        Gie          = add(Gie,         usr.gie);
-
-        emit LeaveStaking(msg.sender, wad, dai_, gov_);
     }
 
-    function harvest() public  {
-        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi();
-        drip();
+    function leaveAllStaking() public {
+        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi(); drip();
         UserInfo storage usr = userInfo[msg.sender];
-        require(usr.amount > 0, "DSReward/invalid");
+        (uint256 gov_, uint256 dai_) = rewardAmounts(msg.sender, chi, pot_chi);
 
         //withdraw gov reward
-        uint256 gov_ = sub(rmul(usr.gie, chi), usr.amount);
+        Gie     = sub(Gie, usr.gie);
+        gov.transfer(msg.sender, gov_);
+
+        //withdraw dai reward & amount 
+        Pie =  sub(Pie, usr.pie);
+        pot.exit(usr.pie);
+        uint256 amt = rmul(usr.pie, pot_chi);
+        daiJoin.exit(msg.sender,  amt);
+
+        emit LeaveStaking(msg.sender, usr.amount, dai_, gov_);
+
+        //update
+        supply       = sub(supply,    usr.amount);
+        delete userInfo[msg.sender];
+    }
+
+    function harvest() public {
+        uint256 pot_chi = (now > pot.rho()) ? pot.drip() : pot.chi(); drip();
+        UserInfo storage usr = userInfo[msg.sender];
+        require(usr.amount > 0, "DSReward/invalid");
+        (uint256 gov_, uint256 dai_) = rewardAmounts(msg.sender, chi, pot_chi);
+
+        //withdraw gov reward
         uint256 gie_ = rdivup(gov_, chi);
         usr.gie = sub(usr.gie, gie_);
         Gie     = sub(Gie,     gie_);
         gov.transfer(msg.sender, gov_);
 
         //withdraw dai reward
-        uint256 dai_ = sub(rmul(usr.pie, pot_chi), usr.amount);
         uint256 pie_ = rdivup(dai_, pot_chi);
         usr.pie = sub(usr.pie, pie_);
         Pie     = sub(Pie,     pie_);
         pot.exit(pie_);
-        uint256 amt = rmul(pie_, pot_chi);
-        daiJoin.exit(msg.sender, amt);
+        dai_ = rmul(pie_, pot_chi);
+        daiJoin.exit(msg.sender, dai_);
 
         emit Harvest(msg.sender, dai_, gov_);
     }
